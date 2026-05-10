@@ -52,14 +52,9 @@ const tokens = TOKENS
     .split('\n').map(s => s.trim())
     .filter(s => s.length > 0 && !s.startsWith('//') && !s.startsWith('#'));
 
-async function sha256Hex(str) {
-    const msgUint8 = new TextEncoder().encode(str);
-    const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
-    const hashArray = Array.from(new Uint8Array(hashBuffer));
-    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-}
 
-// Fetch JSON with 1 retry on non-2xx or non-JSON body (handles transient CF 502/503).
+
+// Fetch JSON with 1 retry on non-2xx or non-JSON body.
 async function fetchJsonSafe(url, options, retries = 1) {
     let lastErr;
     for (let attempt = 0; attempt <= retries; attempt++) {
@@ -79,7 +74,6 @@ async function fetchJsonSafe(url, options, retries = 1) {
 
 async function notify(msg) {
     try {
-        // Telegram has a 4096-char message limit. Truncate and add ellipsis if needed.
         const truncated = msg.length > 4000 ? msg.slice(0, 4000) + '\n... (truncated)' : msg;
         await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
             method: 'POST',
@@ -91,8 +85,8 @@ async function notify(msg) {
     }
 }
 
-// Returns a Set of all token_hash values currently in D1 (1 subreq).
 async function getAllCachedHashes(env) {
+    // Tên cột giữ nguyên "token_hash" để không cần migrate schema.
     const { results } = await env.DB.prepare('SELECT token_hash FROM token_meta').all();
     return new Set(results.map(r => r.token_hash));
 }
@@ -112,8 +106,6 @@ export default {
         }
 
         if (url.pathname === '/batch') {
-            // Defensive: ensure tables exist for the case where /batch is called
-            // directly (e.g. manual testing) outside of a scheduled() invocation.
             try {
                 await env.DB.prepare('CREATE TABLE IF NOT EXISTS token_meta (token_hash TEXT PRIMARY KEY, email TEXT, account_tag TEXT, url TEXT)').run();
                 await env.DB.prepare('CREATE TABLE IF NOT EXISTS cron_state (key TEXT PRIMARY KEY, value TEXT)').run();
@@ -135,51 +127,43 @@ export default {
 
     async scheduled(event, env) {
         const t0 = Date.now();
-        console.log(`scheduled() start | tokens=${tokens.length} | COLD_PER_BATCH=${COLD_PER_BATCH} | WARM_PER_BATCH=${WARM_PER_BATCH} | MAX_FANOUT=${MAX_FANOUT}`);
+        console.log(`scheduled() | tokens=${tokens.length} COLD_PER_BATCH=${COLD_PER_BATCH} WARM_PER_BATCH=${WARM_PER_BATCH} MAX_FANOUT=${MAX_FANOUT}`);
 
         if (tokens.length === 0) {
-            console.log('Token list empty.');
             await notify('Token list is empty.');
             return;
         }
 
-        // Ensure D1 tables exist (blocking before fan-out).
         await env.DB.prepare('CREATE TABLE IF NOT EXISTS token_meta (token_hash TEXT PRIMARY KEY, email TEXT, account_tag TEXT, url TEXT)').run();
         await env.DB.prepare('CREATE TABLE IF NOT EXISTS cron_state (key TEXT PRIMARY KEY, value TEXT)').run();
-        console.log('D1 tables verified.');
 
-        // 1. Pre-fetch all cached hashes to split tokens into warm / cold.
-        //    This single D1 query determines batch sizing — no manual config needed.
-        const cachedHashes = await getAllCachedHashes(env);
-        const allTokenHashes = await Promise.all(tokens.map(t => sha256Hex(t)));
-        const warmIndices = [];
-        const coldIndices = [];
-        allTokenHashes.forEach((h, i) => {
-            if (cachedHashes.has(h)) warmIndices.push(i);
-            else coldIndices.push(i);
+        // Token dùng trực tiếp làm key D1 — không cần hash.
+        const cachedKeys = await getAllCachedHashes(env);
+        const warmPairs = [];
+        const coldPairs = [];
+        tokens.forEach((token, i) => {
+            if (cachedKeys.has(token)) warmPairs.push({ idx: i, key: token });
+            else coldPairs.push({ idx: i, key: token });
         });
-        console.log(`Token split: ${warmIndices.length} warm, ${coldIndices.length} cold`);
+        console.log(`Token split: ${warmPairs.length} warm, ${coldPairs.length} cold`);
 
-        // 2. Compute how many batches fit within the parent's subreq budget.
-        //    Cold batches are processed first to populate D1 as fast as possible.
-        //    After ~ceil(total / COLD_PER_BATCH) runs every token will be warm.
+        // 2. Build batches (cold first).
         const coldBatchCount = Math.min(
-            coldIndices.length > 0 ? Math.ceil(coldIndices.length / COLD_PER_BATCH) : 0,
+            coldPairs.length > 0 ? Math.ceil(coldPairs.length / COLD_PER_BATCH) : 0,
             MAX_FANOUT
         );
         const warmBatchCount = Math.min(
-            warmIndices.length > 0 ? Math.ceil(warmIndices.length / WARM_PER_BATCH) : 0,
+            warmPairs.length > 0 ? Math.ceil(warmPairs.length / WARM_PER_BATCH) : 0,
             MAX_FANOUT - coldBatchCount
         );
         console.log(`Fan-out: ${coldBatchCount} cold batch(es) + ${warmBatchCount} warm batch(es)`);
 
-        // Build index slices for each child batch.
         const batches = [];
         for (let i = 0; i < coldBatchCount; i++) {
-            batches.push(coldIndices.slice(i * COLD_PER_BATCH, (i + 1) * COLD_PER_BATCH));
+            batches.push(coldPairs.slice(i * COLD_PER_BATCH, (i + 1) * COLD_PER_BATCH));
         }
         for (let i = 0; i < warmBatchCount; i++) {
-            batches.push(warmIndices.slice(i * WARM_PER_BATCH, (i + 1) * WARM_PER_BATCH));
+            batches.push(warmPairs.slice(i * WARM_PER_BATCH, (i + 1) * WARM_PER_BATCH));
         }
 
         // 3. Current DNS record.
@@ -188,47 +172,38 @@ export default {
 
         const dnsRes = await fetchJsonSafe(api, { headers });
         if (!dnsRes.ok) {
-            console.log('DNS GET failed:', dnsRes.error);
             await notify(`DNS API error: ${dnsRes.error}`);
             return;
         }
-        const dnsBody = dnsRes.json;
-        const currentContent = dnsBody.result.content;
+        const currentContent = dnsRes.json.result.content;
         console.log('Current DNS:', currentContent);
 
-        // 4. Fan-out parallel batches (each child = fresh 50-subreq budget).
-        const fanOut = batches.map(indices =>
-            env.SELF.fetch(`https://self/batch?indices=${indices.join(',')}`)
+        // 4. Fan-out – truyền token index xuống child, child tự lấy token từ TOKENS[idx].
+        const fanOut = batches.map(pairs => {
+            const pairsStr = pairs.map(p => `${p.idx}`).join(',');
+            return env.SELF.fetch(`https://self/batch?indices=${pairsStr}`)
                 .then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
-                .catch(e => [{ idx: indices[0], error: `fan-out fail: ${e.message}` }])
-        );
+                .catch(e => [{ idx: pairs[0]?.idx, error: `fan-out fail: ${e.message}` }]);
+        });
         const checked = (await Promise.all(fanOut)).flat();
 
-        // Log every token result.
-        console.log(`Per-token results (${checked.length}):`);
         checked.forEach((e, i) => {
-            if (e.error) {
-                console.log(`  [${i.toString().padStart(2, ' ')}] ERR  ${e.email || e.url || 'n/a'} -- ${e.error}`);
-            } else {
-                console.log(`  [${i.toString().padStart(2, ' ')}] OK   ${e.email} ${e.url} requests=${e.requests.toLocaleString()}`);
-            }
+            if (e.error) console.log(`  [${i.toString().padStart(2, ' ')}] ERR  ${e.email || 'n/a'} -- ${e.error}`);
+            else         console.log(`  [${i.toString().padStart(2, ' ')}] OK   ${e.email} ${e.url} req=${e.requests.toLocaleString()}`);
         });
 
-        // 5. Aggregate notifications into ONE message to minimise subrequests.
+        // 5. Aggregate alerts.
         const alerts = [];
 
-        // Report tokens deferred due to parent budget (cold backlog on first runs).
-        const skippedCold = Math.max(0, coldIndices.length - coldBatchCount * COLD_PER_BATCH);
-        const skippedWarm = Math.max(0, warmIndices.length - warmBatchCount * WARM_PER_BATCH);
+        const skippedCold = Math.max(0, coldPairs.length - coldBatchCount * COLD_PER_BATCH);
+        const skippedWarm = Math.max(0, warmPairs.length - warmBatchCount * WARM_PER_BATCH);
         if (skippedCold > 0 || skippedWarm > 0) {
-            console.log(`Deferred: ${skippedCold} cold, ${skippedWarm} warm tokens (will retry next run)`);
-            alerts.push(`${skippedCold} cold + ${skippedWarm} warm token(s) deferred to next run (D1 cache building...)`);
+            alerts.push(`${skippedCold} cold + ${skippedWarm} warm token(s) deferred to next run`);
         }
 
         for (const e of checked) {
             if (e.error) {
-                const id = e.email || (e.idx !== undefined ? `batch@${e.idx}` : 'unknown');
-                alerts.push(`Token error (${id}): ${e.error}`);
+                alerts.push(`Token error (${e.email || 'unknown'}): ${e.error}`);
             } else if (e.requests >= WARNING_LIMIT) {
                 alerts.push(`Warning: ${e.email || e.url} used ${e.requests.toLocaleString()} / 100,000`);
             }
@@ -239,22 +214,19 @@ export default {
             alerts.push(`CNAME ${currentContent} not found in account list!`);
         }
 
-        // 6. Pick best candidate (lowest request count, under WARNING_LIMIT).
+        // 6. Pick best candidate.
         const available = checked.filter(e => !e.error && typeof e.requests === 'number' && e.requests < WARNING_LIMIT);
         if (available.length === 0) {
-            console.log('No available accounts.');
             alerts.push(`All accounts errored or exceeded ${WARNING_LIMIT.toLocaleString()} requests.`);
             if (alerts.length) await notify(alerts.join('\n'));
             return;
         }
         const best = available.reduce((a, b) => a.requests <= b.requests ? a : b);
-        console.log(`Best: ${best.email} / ${best.url} (${best.requests.toLocaleString()} requests)`);
+        console.log(`Best: ${best.email} / ${best.url} (${best.requests.toLocaleString()} req)`);
 
         if (best.url !== currentContent) {
-            // check PATCH response — a silent failure here means DNS never updates.
             const patchRes = await fetchJsonSafe(api, { method: "PATCH", headers, body: JSON.stringify({ content: best.url }) });
             if (!patchRes.ok) {
-                console.error('DNS PATCH failed:', patchRes.error);
                 alerts.push(`DNS PATCH failed: ${patchRes.error}`);
             } else {
                 console.log(`DNS updated: [${currentContent}] -> [${best.url}]`);
@@ -263,23 +235,17 @@ export default {
             console.log(`DNS unchanged: [${best.url}]`);
         }
 
-        // 7. Flush aggregated alerts as a single Telegram message.
         if (alerts.length) {
-            console.log(`Sending ${alerts.length} alert(s) to Telegram.`);
             await notify(alerts.join('\n'));
-        } else {
-            console.log('No alerts.');
         }
 
-        // 8. Daily report at 23:00 UTC, send only once per UTC date.
-        // use a single `now` object to avoid a midnight race between two Date() calls.
+        // 7. Daily report at 23:00 UTC.
         const now = new Date();
         const todayStr = now.toISOString().slice(0, 10);
         if (now.getUTCHours() === 23) {
             let alreadySent = false;
             try {
-                const result = await env.DB.prepare('SELECT value FROM cron_state WHERE key = ?')
-                    .bind(REPORTED_KEY).first();
+                const result = await env.DB.prepare('SELECT value FROM cron_state WHERE key = ?').bind(REPORTED_KEY).first();
                 alreadySent = result && result.value === todayStr;
             } catch { }
 
@@ -289,24 +255,19 @@ export default {
                 const totalCapacity = valid.length * 100000;
                 const totalPercent = totalCapacity > 0 ? ((totalRequests / totalCapacity) * 100).toFixed(2) : 0;
 
-                const reportMsg = [
+                await notify([
                     `Daily Report (UTC)`,
                     `Total requests today: ${totalRequests.toLocaleString()} (${totalPercent}% of ${valid.length} accounts)`,
                     `Current DNS: ${best.url}`,
                     ``,
                     `Reset at 00:00 UTC`,
-                ].join('\n');
+                ].join('\n'));
 
-                await notify(reportMsg);
                 try {
-                    await env.DB.prepare('INSERT OR REPLACE INTO cron_state (key, value) VALUES (?, ?)')
-                        .bind(REPORTED_KEY, todayStr).run();
+                    await env.DB.prepare('INSERT OR REPLACE INTO cron_state (key, value) VALUES (?, ?)').bind(REPORTED_KEY, todayStr).run();
                 } catch (e) {
                     console.error('Failed to save reported date:', e.message);
                 }
-                console.log(`Daily report sent for ${todayStr}.`);
-            } else {
-                console.log(`Daily report already sent for ${todayStr}.`);
             }
         }
 
@@ -314,101 +275,76 @@ export default {
     }
 };
 
-// ---------- Child batch (new invocation, fresh 50-subreq budget) ----------
+// ---------- Child batch ----------
 async function processBatch(tokenList, env) {
-    // 1. Hash all tokens, then batch-fetch cached metadata from D1 in one query.
-    const tokenHashes = await Promise.all(tokenList.map(t => sha256Hex(t)));
-    const placeholders = tokenHashes.map(() => '?').join(',');
+    // Dùng token trực tiếp làm key D1 — không hash.
+    const placeholders = tokenList.map(() => '?').join(',');
     const { results: dbResults } = await env.DB
         .prepare(`SELECT token_hash, email, account_tag, url FROM token_meta WHERE token_hash IN (${placeholders})`)
-        .bind(...tokenHashes).all();
+        .bind(...tokenList).all();
 
     const cache = {};
     dbResults.forEach(row => {
         cache[row.token_hash] = { email: row.email, accountTag: row.account_tag, url: row.url };
     });
-    console.log(`  D1 query: sent ${tokenHashes.length} hashes, returned ${dbResults.length} hit(s)`);
+    console.log(`  D1: sent ${tokenList.length} keys, got ${dbResults.length} hit(s)`);
 
     const dbStats = { inserts: 0, insertErrors: 0, deletes: 0, deleteErrors: 0 };
 
-    // 2. Process all tokens in parallel — parent already enforces batch-size budget.
-    const batchResults = await Promise.all(tokenList.map(async (token, idx) => {
-        const cacheKey = tokenHashes[idx];
+    const batchResults = await Promise.all(tokenList.map(async (token) => {
         const tokenTail = token.slice(-8);
-        const meta = cache[cacheKey] || null;
+        const meta = cache[token] || null;
 
         if (!meta) {
-            // ── COLD path: resolve metadata then fetch usage ──────────────
-            console.log(`  ...${tokenTail} => COLD resolve`);
-
+            // ── COLD path ──
+            console.log(`  ...${tokenTail} => COLD`);
             const newMeta = await resolveMeta(token);
             if (newMeta.error) {
-                console.error(`  ...${tokenTail} meta error: ${newMeta.error}`);
                 return { email: newMeta.email || null, url: null, error: newMeta.error };
             }
 
-            // Persist metadata so subsequent runs take the cheaper WARM path.
             try {
                 await env.DB.prepare(
                     'INSERT OR REPLACE INTO token_meta (token_hash, email, account_tag, url) VALUES (?, ?, ?, ?)'
-                ).bind(cacheKey, newMeta.email, newMeta.accountTag, newMeta.url).run();
+                ).bind(token, newMeta.email, newMeta.accountTag, newMeta.url).run();
                 dbStats.inserts++;
-                console.log(`  ...${tokenTail} cached: ${newMeta.email} => ${newMeta.url}`);
             } catch (e) {
                 dbStats.insertErrors++;
                 console.error(`  ...${tokenTail} DB insert failed: ${e.message}`);
-                // Not fatal — metadata resolved successfully; proceed to usage check.
             }
 
             const usage = await resolveUsage(token, newMeta.accountTag);
             if (usage.error) {
-                const keep = usage.transient ? '(transient, keeping cache)' : '(busting cache)';
-                console.error(`  ...${tokenTail} usage error: ${usage.error} ${keep}`);
                 if (!usage.transient) {
-                    try {
-                        await env.DB.prepare('DELETE FROM token_meta WHERE token_hash = ?').bind(cacheKey).run();
-                        dbStats.deletes++;
-                    } catch (e) {
-                        dbStats.deleteErrors++;
-                        console.error(`  ...${tokenTail} DB delete failed: ${e.message}`);
-                    }
+                    try { await env.DB.prepare('DELETE FROM token_meta WHERE token_hash = ?').bind(token).run(); dbStats.deletes++; }
+                    catch (e) { dbStats.deleteErrors++; }
                 }
                 return { email: newMeta.email, url: newMeta.url, error: usage.error };
             }
 
-            console.log(`  ...${tokenTail} COLD ok: ${newMeta.email} requests=${usage.requests.toLocaleString()}`);
             return { email: newMeta.email, url: newMeta.url, requests: usage.requests, error: null };
 
         } else {
-            // ── WARM path: metadata already cached, only fetch usage ──────
-            console.log(`  ...${tokenTail} => WARM ${meta.email} ${meta.url}`);
+            // ── WARM path ──
+            console.log(`  ...${tokenTail} => WARM ${meta.email}`);
 
             const usage = await resolveUsage(token, meta.accountTag);
             if (usage.error) {
-                const keep = usage.transient ? '(transient, keeping cache)' : '(busting cache)';
-                console.error(`  ...${tokenTail} usage error: ${usage.error} ${keep}`);
                 if (!usage.transient) {
-                    try {
-                        await env.DB.prepare('DELETE FROM token_meta WHERE token_hash = ?').bind(cacheKey).run();
-                        dbStats.deletes++;
-                    } catch (e) {
-                        dbStats.deleteErrors++;
-                        console.error(`  ...${tokenTail} DB delete failed: ${e.message}`);
-                    }
+                    try { await env.DB.prepare('DELETE FROM token_meta WHERE token_hash = ?').bind(token).run(); dbStats.deletes++; }
+                    catch (e) { dbStats.deleteErrors++; }
                 }
                 return { email: meta.email, url: meta.url, error: usage.error };
             }
 
-            console.log(`  ...${tokenTail} WARM ok: requests=${usage.requests.toLocaleString()}`);
             return { email: meta.email, url: meta.url, requests: usage.requests, error: null };
         }
     }));
 
-    console.log(`  batch done — results=${batchResults.length}, D1: inserts=${dbStats.inserts}(err=${dbStats.insertErrors}) deletes=${dbStats.deletes}(err=${dbStats.deleteErrors})`);
+    console.log(`  batch done — results=${batchResults.length} D1: +${dbStats.inserts}(err=${dbStats.insertErrors}) -${dbStats.deletes}(err=${dbStats.deleteErrors})`);
 
-    // 3. Surface DB-level errors to Telegram so they are never silently missed.
     if (dbStats.insertErrors > 0 || dbStats.deleteErrors > 0) {
-        await notify(`Batch DB errors — insert failures: ${dbStats.insertErrors}, delete failures: ${dbStats.deleteErrors}. Check worker logs for details.`);
+        await notify(`Batch DB errors — inserts: ${dbStats.insertErrors}, deletes: ${dbStats.deleteErrors}`);
     }
 
     return batchResults;
@@ -416,16 +352,14 @@ async function processBatch(tokenList, env) {
 
 async function resolveMeta(token) {
     const auth = { Authorization: `Bearer ${token}` };
-
-    // fetch user and accounts in parallel — they are independent requests.
     const [userRes, accRes] = await Promise.all([
         fetchJsonSafe('https://api.cloudflare.com/client/v4/user', { headers: auth }),
         fetchJsonSafe('https://api.cloudflare.com/client/v4/accounts?per_page=1', { headers: auth }),
     ]);
     if (!userRes.ok && !accRes.ok) return { error: `meta fetch failed: ${accRes.error}` };
 
-    const email = userRes.ok ? (userRes.json?.result?.email || null) : null;
-    const accountTag = accRes.ok ? accRes.json?.result?.[0]?.id : null;
+    const email      = userRes.ok ? (userRes.json?.result?.email || null) : null;
+    const accountTag = accRes.ok  ? accRes.json?.result?.[0]?.id : null;
     if (!accountTag) return { email, error: 'Missing Account:Read permission' };
 
     const pagesRes = await fetchJsonSafe(
@@ -434,26 +368,33 @@ async function resolveMeta(token) {
     );
     if (!pagesRes.ok) return { email, error: `pages fetch failed: ${pagesRes.error}` };
     const project = pagesRes.json?.result?.[0];
-    if (!project) return { email, error: 'Missing Pages:Read permission or no Pages project exists' };
+    if (!project) return { email, error: 'Missing Pages:Read permission or no Pages project' };
 
     return { email, accountTag, url: project.subdomain };
 }
 
 async function resolveUsage(token, accountTag) {
     const now = new Date();
+
+    // ------------------------------------------------------------------
+    // FIX 3: Query ONLY today's date instead of the entire month.
+    //         Original: date_geq=monthStart → up to 30 rows per query type per token.
+    //         Fixed:    date_geq=today      → at most 1 row per query type per token.
+    //         With 25 warm tokens × 2 arrays × 30 rows = 1500 objects parsed.
+    //         Fixed:    25 × 2 × 1          = 50 objects.  ~30× less JSON work.
+    // ------------------------------------------------------------------
     const today = now.toISOString().slice(0, 10);
-    const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString().slice(0, 10);
 
     const gqlQuery = `
-        query($accountTag: String!, $start: Date!, $end: Date!) {
+        query($accountTag: String!, $date: Date!) {
             viewer {
                 accounts(filter: { accountTag: $accountTag }) {
                     workersInvocationsAdaptive(
-                        limit: 10000 filter: { date_geq: $start, date_leq: $end } orderBy: [date_ASC]
-                    ) { dimensions { date } sum { requests } }
+                        limit: 10 filter: { date_geq: $date, date_leq: $date }
+                    ) { sum { requests } }
                     pagesFunctionsInvocationsAdaptiveGroups(
-                        limit: 10000 filter: { date_geq: $start, date_leq: $end } orderBy: [date_ASC]
-                    ) { dimensions { date } sum { requests } }
+                        limit: 10 filter: { date_geq: $date, date_leq: $date }
+                    ) { sum { requests } }
                 }
             }
         }
@@ -462,11 +403,9 @@ async function resolveUsage(token, accountTag) {
     const gql = await fetchJsonSafe('https://api.cloudflare.com/client/v4/graphql', {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: gqlQuery, variables: { accountTag, start: monthStart, end: today } }),
+        body: JSON.stringify({ query: gqlQuery, variables: { accountTag, date: today } }),
     });
     if (!gql.ok) return { error: `graphql ${gql.error}`, transient: true };
-
-    // include the actual GraphQL error message instead of hardcoding "Missing permission".
     if (gql.json.errors) return {
         error: `GraphQL error: ${gql.json.errors.map(e => e.message).join('; ')}`,
         transient: false,
@@ -475,10 +414,9 @@ async function resolveUsage(token, accountTag) {
     const acc = gql.json.data?.viewer?.accounts?.[0];
     if (!acc) return { error: 'Missing Account Analytics:Read permission' };
 
-    const sumToday = (rows) =>
-        (rows || []).filter(r => r.dimensions.date === today).reduce((s, r) => s + r.sum.requests, 0);
+    const sum = (rows) => (rows || []).reduce((s, r) => s + (r.sum?.requests || 0), 0);
 
     return {
-        requests: sumToday(acc.workersInvocationsAdaptive) + sumToday(acc.pagesFunctionsInvocationsAdaptiveGroups),
+        requests: sum(acc.workersInvocationsAdaptive) + sum(acc.pagesFunctionsInvocationsAdaptiveGroups),
     };
 }
