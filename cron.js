@@ -72,7 +72,7 @@ async function fetchJsonSafe(url, options, retries = 1) {
                 catch { lastErr = new Error(`HTTP ${res.status} non-JSON`); }
             }
         } catch (e) { lastErr = e; }
-        if (attempt < retries) await new Promise(r => setTimeout(r, 250));
+        if (attempt < retries) await new Promise(r => setTimeout(r, 1000));
     }
     return { ok: false, error: lastErr.message };
 }
@@ -186,13 +186,13 @@ export default {
         const api = `https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${CF_RECORD_ID}`;
         const headers = { "Authorization": `Bearer ${CF_API_TOKEN}`, "Content-Type": "application/json" };
 
-        const resGet = await fetch(api, { headers });
-        const dnsBody = await resGet.json();
-        if (!dnsBody.success) {
-            console.log('DNS GET failed:', JSON.stringify(dnsBody.errors));
-            await notify(`DNS API error: ${JSON.stringify(dnsBody.errors)}`);
+        const dnsRes = await fetchJsonSafe(api, { headers });
+        if (!dnsRes.ok) {
+            console.log('DNS GET failed:', dnsRes.error);
+            await notify(`DNS API error: ${dnsRes.error}`);
             return;
         }
+        const dnsBody = dnsRes.json;
         const currentContent = dnsBody.result.content;
         console.log('Current DNS:', currentContent);
 
@@ -252,11 +252,10 @@ export default {
 
         if (best.url !== currentContent) {
             // check PATCH response — a silent failure here means DNS never updates.
-            const patchRes = await fetch(api, { method: "PATCH", headers, body: JSON.stringify({ content: best.url }) });
-            const patchBody = await patchRes.json();
-            if (!patchBody.success) {
-                console.error('DNS PATCH failed:', JSON.stringify(patchBody.errors));
-                alerts.push(`DNS PATCH failed: ${JSON.stringify(patchBody.errors)}`);
+            const patchRes = await fetchJsonSafe(api, { method: "PATCH", headers, body: JSON.stringify({ content: best.url }) });
+            if (!patchRes.ok) {
+                console.error('DNS PATCH failed:', patchRes.error);
+                alerts.push(`DNS PATCH failed: ${patchRes.error}`);
             } else {
                 console.log(`DNS updated: [${currentContent}] -> [${best.url}]`);
             }
