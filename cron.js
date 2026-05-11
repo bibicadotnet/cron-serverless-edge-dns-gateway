@@ -182,7 +182,7 @@ export default {
         }
 
         for (const e of checked) {
-            if (e.error) {
+            if (e.error && !e.transient) {
                 alerts.push(`Token error (${e.email || 'unknown'}): ${e.error}`);
             } else if (e.requests >= WARNING_LIMIT) {
                 alerts.push(`Warning: ${e.email || e.url} used ${e.requests.toLocaleString()} / 100,000`);
@@ -312,7 +312,7 @@ async function processBatch(tokenList, env) {
                     try { await env.DB.prepare('DELETE FROM token_meta WHERE token_hash = ?').bind(token).run(); dbStats.deletes++; }
                     catch (e) { dbStats.deleteErrors++; console.error(`  ...${tokenTail} DB delete failed: ${e.message}`); }
                 }
-                return { email: newMeta.email, url: newMeta.url, error: usage.error };
+                return { email: newMeta.email, url: newMeta.url, error: usage.error, transient: usage.transient };
             }
 
             console.log(`  ...${tokenTail} COLD ok: ${newMeta.email} requests=${usage.requests.toLocaleString()}`);
@@ -330,7 +330,7 @@ async function processBatch(tokenList, env) {
                     try { await env.DB.prepare('DELETE FROM token_meta WHERE token_hash = ?').bind(token).run(); dbStats.deletes++; }
                     catch (e) { dbStats.deleteErrors++; console.error(`  ...${tokenTail} DB delete failed: ${e.message}`); }
                 }
-                return { email: meta.email, url: meta.url, error: usage.error };
+                return { email: meta.email, url: meta.url, error: usage.error, transient: usage.transient };
             }
 
             console.log(`  ...${tokenTail} WARM ok: requests=${usage.requests.toLocaleString()}`);
@@ -394,10 +394,11 @@ async function resolveUsage(token, accountTag) {
         body: JSON.stringify({ query: gqlQuery, variables: { accountTag, date: today } }),
     }, 1);  // 1 retry for transient 502/503 errors
     if (!gql.ok) return { error: `graphql ${gql.error}`, transient: true };
-    if (gql.json.errors) return {
-        error: `GraphQL error: ${gql.json.errors.map(e => e.message).join('; ')}`,
-        transient: false,
-    };
+    if (gql.json.errors) {
+        const errMsg = gql.json.errors.map(e => e.message).join('; ');
+        const isTransient = /internal server error|too many|rate limit|timeout/i.test(errMsg);
+        return { error: `GraphQL error: ${errMsg}`, transient: isTransient };
+    }
 
     const acc = gql.json.data?.viewer?.accounts?.[0];
     if (!acc) return { error: 'Missing Account Analytics:Read permission' };
