@@ -105,7 +105,6 @@ export default {
 
 	async scheduled(event, env) {
 		const t0 = Date.now();
-		const todayStr = new Date().toISOString().slice(0, 10);
 		console.log(`scheduled() | tokens=${tokens.length} COLD_PER_BATCH=${COLD_PER_BATCH} WARM_PER_BATCH=${WARM_PER_BATCH} MAX_FANOUT=${MAX_FANOUT}`);
 
 		if (tokens.length === 0) {
@@ -116,20 +115,6 @@ export default {
 		await env.DB.prepare('CREATE TABLE IF NOT EXISTS token_meta (token_hash TEXT PRIMARY KEY, email TEXT, account_tag TEXT, url TEXT)').run();
 		await env.DB.prepare('CREATE TABLE IF NOT EXISTS cron_state (key TEXT PRIMARY KEY, value TEXT)').run();
 		console.log('D1 tables verified.');
-
-		// Load already-warned tokens for today (dedup WARNING_LIMIT alerts).
-		let warnedToday = new Set();
-		try {
-			const { results: warnedRows } = await env.DB.prepare(
-				"SELECT key, value FROM cron_state WHERE key LIKE 'warned_%'"
-			).all();
-			warnedToday = new Set(
-				warnedRows.filter(r => r.value === todayStr).map(r => r.key)
-			);
-			console.log(`Loaded ${warnedToday.size} already-warned token(s) for ${todayStr}.`);
-		} catch (e) {
-			console.error('Failed to load warned set:', e.message);
-		}
 
 		const cachedKeys = await getAllCachedHashes(env);
 		const warmPairs = [];
@@ -159,35 +144,17 @@ export default {
 			batches.push(warmPairs.slice(i * WARM_PER_BATCH, (i + 1) * WARM_PER_BATCH));
 		}
 
-		// 3. Current DNS record -- cache-first to avoid CF API rate limits (429).
+		// 3. Current DNS record.
 		const api = `https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${CF_RECORD_ID}`;
 		const headers = { "Authorization": `Bearer ${CF_API_TOKEN}`, "Content-Type": "application/json" };
 
-		let currentContent;
-		try {
-			const cached = await env.DB.prepare('SELECT value FROM cron_state WHERE key = ?').bind('current_dns').first();
-			if (cached && cached.value) {
-				currentContent = cached.value;
-				console.log('Current DNS (cache):', currentContent);
-			}
-		} catch (e) {
-			console.error('Failed to read DNS cache:', e.message);
+		const dnsRes = await fetchJsonSafe(api, { headers });
+		if (!dnsRes.ok) {
+			await notify(`DNS API error: ${dnsRes.error}`);
+			return;
 		}
-
-		if (!currentContent) {
-			const dnsRes = await fetchJsonSafe(api, { headers });
-			if (!dnsRes.ok) {
-				await notify(`DNS API error: ${dnsRes.error}`);
-				return;
-			}
-			currentContent = dnsRes.json.result.content;
-			console.log('Current DNS (live):', currentContent);
-			try {
-				await env.DB.prepare('INSERT OR REPLACE INTO cron_state (key, value) VALUES (?, ?)').bind('current_dns', currentContent).run();
-			} catch (e) {
-				console.error('Failed to cache DNS value:', e.message);
-			}
-		}
+		const currentContent = dnsRes.json.result.content;
+		console.log('Current DNS:', currentContent);
 
 		// 4. Fan-out child batches.
 		const fanOut = batches.map(pairs => {
@@ -206,7 +173,6 @@ export default {
 
 		// 5. Aggregate alerts.
 		const alerts = [];
-		const newWarnings = []; // WARNING_LIMIT alerts to persist after sending
 
 		const skippedCold = Math.max(0, coldPairs.length - coldBatchCount * COLD_PER_BATCH);
 		const skippedWarm = Math.max(0, warmPairs.length - warmBatchCount * WARM_PER_BATCH);
@@ -215,55 +181,51 @@ export default {
 			alerts.push(`${skippedCold} cold + ${skippedWarm} warm token(s) deferred to next run`);
 		}
 
+		// Dedup WARNING_LIMIT alerts: load tokens already warned today from D1.
+		const todayStr = new Date().toISOString().slice(0, 10);
+		let warnedToday = new Set();
+		try {
+			const { results: wRows } = await env.DB.prepare("SELECT key FROM cron_state WHERE key LIKE 'warned_%' AND value = ?").bind(todayStr).all();
+			warnedToday = new Set(wRows.map(r => r.key));
+		} catch (e) { console.error('Failed to load warned set:', e.message); }
+
+		const newWarnings = [];
 		for (const e of checked) {
 			if (e.error && !e.transient) {
 				alerts.push(`Token error (${e.email || 'unknown'}): ${e.error}`);
 			} else if (e.requests >= WARNING_LIMIT) {
-				// Deduplication: only alert once per token per day.
-				const warnKey = `warned_${e.email || e.url}`;
-				if (!warnedToday.has(warnKey)) {
+				const wKey = `warned_${e.email || e.url}`;
+				if (!warnedToday.has(wKey)) {
 					alerts.push(`Warning: ${e.email || e.url} used ${e.requests.toLocaleString()} / 100,000`);
-					newWarnings.push(warnKey);
-				} else {
-					console.log(`Skipping duplicate warning for ${e.email || e.url} (already sent today).`);
+					newWarnings.push(wKey);
 				}
 			}
 		}
 
-		// 6. Pick best candidate.
-		// Coerce requests to Number to handle string "0" from fan-out JSON.
-		const available = checked
-			.filter(e => !e.error && e.requests != null && !isNaN(Number(e.requests)))
-			.map(e => ({ ...e, requests: Number(e.requests) }))
-			.filter(e => e.requests < WARNING_LIMIT);
-
-		// CNAME check: only run when no accounts were deferred this run,
-		// otherwise the current DNS account may simply be in a deferred batch.
-		const allCheckedUrls = checked.filter(e => !e.error).map(e => e.url);
-		const noDeferred = skippedCold === 0 && skippedWarm === 0;
-		if (noDeferred && !allCheckedUrls.includes(currentContent.trim())) {
-			alerts.push(`CNAME ${currentContent} not found in any account!`);
+		const allUrls = checked.filter(e => !e.error).map(e => e.url);
+		if (!allUrls.includes(currentContent)) {
+			alerts.push(`CNAME ${currentContent} not found in account list!`);
 		}
 
+		// 6. Pick best candidate.
+		const available = checked.filter(e => !e.error && typeof e.requests === 'number' && e.requests < WARNING_LIMIT);
 		if (available.length === 0) {
 			console.log('No available accounts.');
-			alerts.push(`All ${checked.length} checked account(s) errored or exceeded ${WARNING_LIMIT.toLocaleString()} requests.`);
+			alerts.push(`All accounts errored or exceeded ${WARNING_LIMIT.toLocaleString()} requests.`);
 			if (alerts.length) await notify(alerts.join('\n'));
 			return;
 		}
-
-		// Rotation when requests = 0: Cloudflare sometimes doesn't count requests,
-		// so if the current account shows 0 and other accounts also show 0, rotate
-		// sequentially (sorted by URL) so every account gets a turn, not ping-pong.
+		// 0-req rotation: if current account shows 0 and others also show 0
+		// (Cloudflare sometimes stops counting), rotate sequentially by URL
+		// so all accounts get a turn instead of ping-ponging between two.
 		const currentAccount = available.find(e => e.url === currentContent);
 		const zeroAccounts = available.filter(e => e.requests === 0);
 		let best;
 		if (currentAccount && currentAccount.requests === 0 && zeroAccounts.length > 1) {
 			const sorted = zeroAccounts.slice().sort((a, b) => a.url < b.url ? -1 : 1);
-			const currentIdx = sorted.findIndex(e => e.url === currentContent);
-			const nextIdx = (currentIdx + 1) % sorted.length;
-			best = sorted[nextIdx];
-			console.log(`0-req rotation: [${currentContent}] -> [${best.url}] (${zeroAccounts.length} accounts at 0, pos ${currentIdx} -> ${nextIdx})`);
+			const idx = sorted.findIndex(e => e.url === currentContent);
+			best = sorted[(idx + 1) % sorted.length];
+			console.log(`0-req rotation: [${currentContent}] -> [${best.url}] (${zeroAccounts.length} at 0, pos ${idx} -> ${(idx + 1) % sorted.length})`);
 		} else {
 			best = available.reduce((a, b) => a.requests <= b.requests ? a : b);
 		}
@@ -275,12 +237,6 @@ export default {
 				alerts.push(`DNS PATCH failed: ${patchRes.error}`);
 			} else {
 				console.log(`DNS updated: [${currentContent}] -> [${best.url}]`);
-				// Update cache so next run skips the CF API GET.
-				try {
-					await env.DB.prepare('INSERT OR REPLACE INTO cron_state (key, value) VALUES (?, ?)').bind('current_dns', best.url).run();
-				} catch (e) {
-					console.error('Failed to update DNS cache after PATCH:', e.message);
-				}
 			}
 		} else {
 			console.log(`DNS unchanged: [${best.url}]`);
@@ -293,16 +249,11 @@ export default {
 			console.log('No alerts.');
 		}
 
-		// Persist newly-fired WARNING_LIMIT alerts so they aren't sent again today.
-		if (newWarnings.length > 0) {
-			for (const key of newWarnings) {
-				try {
-					await env.DB.prepare('INSERT OR REPLACE INTO cron_state (key, value) VALUES (?, ?)').bind(key, todayStr).run();
-				} catch (e) {
-					console.error(`Failed to save warning state for ${key}:`, e.message);
-				}
-			}
-			console.log(`Persisted ${newWarnings.length} new warning flag(s) for ${todayStr}.`);
+		// Persist WARNING_LIMIT dedup flags so they are not re-sent today.
+		for (const key of newWarnings) {
+			try {
+				await env.DB.prepare('INSERT OR REPLACE INTO cron_state (key, value) VALUES (?, ?)').bind(key, todayStr).run();
+			} catch (e) { console.error(`Failed to save warn flag ${key}:`, e.message); }
 		}
 
 		// 7. Daily report at 23:00 UTC.
