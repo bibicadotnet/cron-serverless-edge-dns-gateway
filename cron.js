@@ -234,7 +234,11 @@ export default {
 		if (best.url !== currentContent) {
 			const patchRes = await fetchJsonSafe(api, { method: "PATCH", headers, body: JSON.stringify({ content: best.url }) });
 			if (!patchRes.ok) {
-				alerts.push(`DNS PATCH failed: ${patchRes.error}`);
+				if (patchRes.error.includes('429')) {
+					console.log(`DNS PATCH rate limited (429), skipping alert — will retry next run`);
+				} else {
+					alerts.push(`DNS PATCH failed: ${patchRes.error}`);
+				}
 			} else {
 				console.log(`DNS updated: [${currentContent}] -> [${best.url}]`);
 			}
