@@ -1,11 +1,11 @@
 // ================= CONFIGURATION =================
 const TELEGRAM_BOT_TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN_HERE';
 const TELEGRAM_CHAT_ID = 'YOUR_TELEGRAM_CHAT_ID_HERE';
- 
+
 const CF_API_TOKEN = "YOUR_CLOUDFLARE_MASTER_API_TOKEN";
 const CF_ZONE_ID = "YOUR_CLOUDFLARE_ZONE_ID";
 const CF_RECORD_ID = "YOUR_CLOUDFLARE_RECORD_ID";
- 
+
 const WARNING_LIMIT = 80_000;
 
 const TOKENS = `
@@ -14,8 +14,6 @@ const TOKENS = `
 // cfut_xxxxx_2
 `;
 // ==================================================
-
-const REPORTED_KEY = "last_daily_report_date";
 
 // ===================== NO NEED TO EDIT THIS SECTION =====================
 // Automatic limit based on Cloudflare Workers free tier (50 subreqs/invocation)
@@ -34,25 +32,32 @@ const COLD_COST = 9;  // resolveMeta (3 fetches w/ retry) + D1 INSERT + GraphQL
 const WARM_COST = 1;  // 1 GraphQL fetch (+ 1 retry on failure, covered by overhead)
 const COLD_PER_BATCH = Math.floor((CHILD_BUDGET - CHILD_OVERHEAD) / COLD_COST); // 4
 const WARM_PER_BATCH = Math.floor((CHILD_BUDGET - CHILD_OVERHEAD) / WARM_COST); // 40
-// ===================================================================
+const MAX_DELETES = 5; // Cap D1 DELETEs per child to stay within subrequest budget
+// ========================================================================
 
 const tokens = TOKENS
 	.split('\n').map(s => s.trim())
 	.filter(s => s.length > 0 && !s.startsWith('//') && !s.startsWith('#'));
 
-// Fetch JSON with 1 retry on non-2xx or non-JSON body.
+// Fetch JSON with retries on non-2xx or non-JSON body.
 async function fetchJsonSafe(url, options, retries = 1) {
 	let lastErr;
 	for (let attempt = 0; attempt <= retries; attempt++) {
 		try {
 			const res = await fetch(url, options);
 			const text = await res.text();
-			if (!res.ok) { lastErr = new Error(`HTTP ${res.status}`); }
-			else {
-				try { return { ok: true, json: JSON.parse(text) }; }
-				catch { lastErr = new Error(`HTTP ${res.status} non-JSON`); }
+			if (!res.ok) {
+				lastErr = new Error(`HTTP ${res.status}`);
+			} else {
+				try {
+					return { ok: true, json: JSON.parse(text) };
+				} catch {
+					lastErr = new Error(`HTTP ${res.status} non-JSON`);
+				}
 			}
-		} catch (e) { lastErr = e; }
+		} catch (e) {
+			lastErr = e;
+		}
 		if (attempt < retries) await new Promise(r => setTimeout(r, 1000));
 	}
 	return { ok: false, error: lastErr.message };
@@ -76,14 +81,18 @@ async function getAllCachedHashes(env) {
 	return new Set(results.map(r => r.token_hash));
 }
 
+async function initDb(env) {
+	await env.DB.prepare('CREATE TABLE IF NOT EXISTS token_meta (token_hash TEXT PRIMARY KEY, email TEXT, account_tag TEXT, url TEXT)').run();
+	await env.DB.prepare('CREATE TABLE IF NOT EXISTS cron_state (key TEXT PRIMARY KEY, value TEXT)').run();
+}
+
 export default {
 	async fetch(req, env) {
 		const url = new URL(req.url);
 
 		if (url.pathname === '/init-db') {
 			try {
-				await env.DB.prepare('CREATE TABLE IF NOT EXISTS token_meta (token_hash TEXT PRIMARY KEY, email TEXT, account_tag TEXT, url TEXT)').run();
-				await env.DB.prepare('CREATE TABLE IF NOT EXISTS cron_state (key TEXT PRIMARY KEY, value TEXT)').run();
+				await initDb(env);
 				return new Response('Database tables created.', { status: 200 });
 			} catch (e) {
 				return new Response(`DB init failed: ${e.message}`, { status: 500 });
@@ -112,8 +121,8 @@ export default {
 			return;
 		}
 
-		await env.DB.prepare('CREATE TABLE IF NOT EXISTS token_meta (token_hash TEXT PRIMARY KEY, email TEXT, account_tag TEXT, url TEXT)').run();
-		await env.DB.prepare('CREATE TABLE IF NOT EXISTS cron_state (key TEXT PRIMARY KEY, value TEXT)').run();
+		// 1. Init DB + split tokens into warm/cold.
+		await initDb(env);
 		console.log('D1 tables verified.');
 
 		const cachedKeys = await getAllCachedHashes(env);
@@ -144,11 +153,11 @@ export default {
 			batches.push(warmPairs.slice(i * WARM_PER_BATCH, (i + 1) * WARM_PER_BATCH));
 		}
 
-		// 3. Current DNS record.
-		const api = `https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${CF_RECORD_ID}`;
-		const headers = { "Authorization": `Bearer ${CF_API_TOKEN}`, "Content-Type": "application/json" };
+		// 3. Get current DNS record.
+		const dnsApi = `https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${CF_RECORD_ID}`;
+		const masterHeaders = { "Authorization": `Bearer ${CF_API_TOKEN}`, "Content-Type": "application/json" };
 
-		const dnsRes = await fetchJsonSafe(api, { headers });
+		const dnsRes = await fetchJsonSafe(dnsApi, { headers: masterHeaders });
 		if (!dnsRes.ok) {
 			await notify(`DNS API error: ${dnsRes.error}`);
 			return;
@@ -156,14 +165,14 @@ export default {
 		const currentContent = dnsRes.json.result.content;
 		console.log('Current DNS:', currentContent);
 
-		// 4. Fan-out child batches.
-		const fanOut = batches.map(pairs => {
-			const pairsStr = pairs.map(p => `${p.idx}`).join(',');
-			return env.SELF.fetch(`https://self/batch?indices=${pairsStr}`)
+		// 4. Fan-out child batches in parallel.
+		const fanOutPromises = batches.map(pairs => {
+			const indicesStr = pairs.map(p => p.idx).join(',');
+			return env.SELF.fetch(`https://self/batch?indices=${indicesStr}`)
 				.then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
 				.catch(e => [{ idx: pairs[0]?.idx, error: `fan-out fail: ${e.message}` }]);
 		});
-		const checked = (await Promise.all(fanOut)).flat();
+		const checked = (await Promise.all(fanOutPromises)).flat();
 
 		console.log(`Per-token results (${checked.length}):`);
 		checked.forEach((e, i) => {
@@ -185,9 +194,13 @@ export default {
 		const todayStr = new Date().toISOString().slice(0, 10);
 		let warnedToday = new Set();
 		try {
-			const { results: wRows } = await env.DB.prepare("SELECT key FROM cron_state WHERE key LIKE 'warned_%' AND value = ?").bind(todayStr).all();
+			const { results: wRows } = await env.DB.prepare(
+				"SELECT key FROM cron_state WHERE key LIKE 'warned_%' AND value = ?"
+			).bind(todayStr).all();
 			warnedToday = new Set(wRows.map(r => r.key));
-		} catch (e) { console.error('Failed to load warned set:', e.message); }
+		} catch (e) {
+			console.error('Failed to load warned set:', e.message);
+		}
 
 		const newWarnings = [];
 		for (const e of checked) {
@@ -215,24 +228,31 @@ export default {
 			if (alerts.length) await notify(alerts.join('\n'));
 			return;
 		}
-		// 0-req rotation: if current account shows 0 and others also show 0
-		// (Cloudflare sometimes stops counting), rotate sequentially by URL
-		// so all accounts get a turn instead of ping-ponging between two.
+
+		// Tie rotation: when multiple accounts share the same minimum requests value,
+		// rotate sequentially by URL so all accounts get a turn instead of always
+		// picking the first one (covers 0-req case and any other tie).
 		const currentAccount = available.find(e => e.url === currentContent);
-		const zeroAccounts = available.filter(e => e.requests === 0);
+		const minRequests = available.reduce((min, e) => Math.min(min, e.requests), Infinity);
+		const tiedAccounts = available.filter(e => e.requests === minRequests);
 		let best;
-		if (currentAccount && currentAccount.requests === 0 && zeroAccounts.length > 1) {
-			const sorted = zeroAccounts.slice().sort((a, b) => a.url < b.url ? -1 : 1);
+		if (currentAccount && currentAccount.requests === minRequests && tiedAccounts.length > 1) {
+			const sorted = tiedAccounts.slice().sort((a, b) => a.url < b.url ? -1 : 1);
 			const idx = sorted.findIndex(e => e.url === currentContent);
 			best = sorted[(idx + 1) % sorted.length];
-			console.log(`0-req rotation: [${currentContent}] -> [${best.url}] (${zeroAccounts.length} at 0, pos ${idx} -> ${(idx + 1) % sorted.length})`);
+			console.log(`Tie rotation (${minRequests} req): [${currentContent}] -> [${best.url}] (${tiedAccounts.length} tied, pos ${idx} -> ${(idx + 1) % sorted.length})`);
 		} else {
-			best = available.reduce((a, b) => a.requests <= b.requests ? a : b);
+			best = tiedAccounts[0];
 		}
 		console.log(`Best: ${best.email} / ${best.url} (${best.requests.toLocaleString()} req)`);
 
+		// 7. Update DNS if needed.
 		if (best.url !== currentContent) {
-			const patchRes = await fetchJsonSafe(api, { method: "PATCH", headers, body: JSON.stringify({ content: best.url }) });
+			const patchRes = await fetchJsonSafe(dnsApi, {
+				method: "PATCH",
+				headers: masterHeaders,
+				body: JSON.stringify({ content: best.url }),
+			});
 			if (!patchRes.ok) {
 				if (patchRes.error.includes('429')) {
 					console.log(`DNS PATCH rate limited (429), skipping alert — will retry next run`);
@@ -246,6 +266,7 @@ export default {
 			console.log(`DNS unchanged: [${best.url}]`);
 		}
 
+		// 8. Send alerts.
 		if (alerts.length) {
 			console.log(`Sending ${alerts.length} alert(s) to Telegram.`);
 			await notify(alerts.join('\n'));
@@ -253,19 +274,21 @@ export default {
 			console.log('No alerts.');
 		}
 
-		// Persist WARNING_LIMIT dedup flags so they are not re-sent today.
+		// 9. Persist WARNING_LIMIT dedup flags.
 		for (const key of newWarnings) {
 			try {
 				await env.DB.prepare('INSERT OR REPLACE INTO cron_state (key, value) VALUES (?, ?)').bind(key, todayStr).run();
-			} catch (e) { console.error(`Failed to save warn flag ${key}:`, e.message); }
+			} catch (e) {
+				console.error(`Failed to save warn flag ${key}:`, e.message);
+			}
 		}
 
-		// 7. Daily report at 23:00 UTC.
+		// 10. Daily report at 23:00 UTC.
 		const now = new Date();
 		if (now.getUTCHours() === 23) {
 			let alreadySent = false;
 			try {
-				const result = await env.DB.prepare('SELECT value FROM cron_state WHERE key = ?').bind(REPORTED_KEY).first();
+				const result = await env.DB.prepare('SELECT value FROM cron_state WHERE key = ?').bind('last_daily_report_date').first();
 				alreadySent = result && result.value === todayStr;
 			} catch { }
 
@@ -284,7 +307,7 @@ export default {
 				].join('\n'));
 
 				try {
-					await env.DB.prepare('INSERT OR REPLACE INTO cron_state (key, value) VALUES (?, ?)').bind(REPORTED_KEY, todayStr).run();
+					await env.DB.prepare('INSERT OR REPLACE INTO cron_state (key, value) VALUES (?, ?)').bind('last_daily_report_date', todayStr).run();
 				} catch (e) {
 					console.error('Failed to save reported date:', e.message);
 				}
@@ -295,7 +318,7 @@ export default {
 		}
 
 		console.log(`scheduled() done in ${Date.now() - t0}ms`);
-	}
+	},
 };
 
 // ---------- Child batch ----------
@@ -312,9 +335,6 @@ async function processBatch(tokenList, env) {
 	console.log(`  D1: sent ${tokenList.length} keys, got ${dbResults.length} hit(s)`);
 
 	const dbStats = { inserts: 0, insertErrors: 0, deletes: 0, deleteErrors: 0 };
-
-	// Cap D1 DELETEs to stay within subrequest budget.
-	const MAX_DELETES = 5;
 
 	const batchResults = await Promise.all(tokenList.map(async (token) => {
 		const tokenTail = token.slice(-8);
@@ -345,8 +365,13 @@ async function processBatch(tokenList, env) {
 				const keep = usage.transient ? '(transient, keeping cache)' : '(busting cache)';
 				console.error(`  ...${tokenTail} usage error: ${usage.error} ${keep}`);
 				if (!usage.transient && dbStats.deletes < MAX_DELETES) {
-					try { await env.DB.prepare('DELETE FROM token_meta WHERE token_hash = ?').bind(token).run(); dbStats.deletes++; }
-					catch (e) { dbStats.deleteErrors++; console.error(`  ...${tokenTail} DB delete failed: ${e.message}`); }
+					try {
+						await env.DB.prepare('DELETE FROM token_meta WHERE token_hash = ?').bind(token).run();
+						dbStats.deletes++;
+					} catch (e) {
+						dbStats.deleteErrors++;
+						console.error(`  ...${tokenTail} DB delete failed: ${e.message}`);
+					}
 				}
 				return { email: newMeta.email, url: newMeta.url, error: usage.error, transient: usage.transient };
 			}
@@ -363,8 +388,13 @@ async function processBatch(tokenList, env) {
 				const keep = usage.transient ? '(transient, keeping cache)' : '(busting cache)';
 				console.error(`  ...${tokenTail} usage error: ${usage.error} ${keep}`);
 				if (!usage.transient && dbStats.deletes < MAX_DELETES) {
-					try { await env.DB.prepare('DELETE FROM token_meta WHERE token_hash = ?').bind(token).run(); dbStats.deletes++; }
-					catch (e) { dbStats.deleteErrors++; console.error(`  ...${tokenTail} DB delete failed: ${e.message}`); }
+					try {
+						await env.DB.prepare('DELETE FROM token_meta WHERE token_hash = ?').bind(token).run();
+						dbStats.deletes++;
+					} catch (e) {
+						dbStats.deleteErrors++;
+						console.error(`  ...${tokenTail} DB delete failed: ${e.message}`);
+					}
 				}
 				return { email: meta.email, url: meta.url, error: usage.error, transient: usage.transient };
 			}
@@ -428,7 +458,8 @@ async function resolveUsage(token, accountTag) {
 		method: 'POST',
 		headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
 		body: JSON.stringify({ query: gqlQuery, variables: { accountTag, date: today } }),
-	}, 1);  // 1 retry for transient 502/503 errors
+	}, 1); // 1 retry for transient 502/503 errors
+
 	if (!gql.ok) return { error: `graphql ${gql.error}`, transient: true };
 	if (gql.json.errors) {
 		const errMsg = gql.json.errors.map(e => e.message).join('; ');
