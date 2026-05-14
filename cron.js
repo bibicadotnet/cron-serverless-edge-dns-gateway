@@ -18,8 +18,8 @@ const TOKENS = `
 // ===================== NO NEED TO EDIT THIS SECTION =====================
 // Automatic limit based on Cloudflare Workers free tier (50 subreqs/invocation)
 const PARENT_BUDGET = 50;
-const PARENT_OVERHEAD = 9;
-const MAX_FANOUT = PARENT_BUDGET - PARENT_OVERHEAD; // 41
+const PARENT_OVERHEAD = 7; // FIX ①: removed 2 initDb subreqs from overhead
+const MAX_FANOUT = PARENT_BUDGET - PARENT_OVERHEAD; // 43
 
 const CHILD_BUDGET = 50;
 // CHILD_OVERHEAD breakdown:
@@ -31,7 +31,8 @@ const CHILD_OVERHEAD = 10;
 const COLD_COST = 9;  // resolveMeta (3 fetches w/ retry) + D1 INSERT + GraphQL
 const WARM_COST = 1;  // 1 GraphQL fetch (+ 1 retry on failure, covered by overhead)
 const COLD_PER_BATCH = Math.floor((CHILD_BUDGET - CHILD_OVERHEAD) / COLD_COST); // 4
-const WARM_PER_BATCH = Math.floor((CHILD_BUDGET - CHILD_OVERHEAD) / WARM_COST); // 40
+// FIX ⑤: reduced WARM_PER_BATCH from 40 → 20 to halve the concurrent JSON.parse burst
+const WARM_PER_BATCH = 20;
 const MAX_DELETES = 5; // Cap D1 DELETEs per child to stay within subrequest budget
 // ========================================================================
 
@@ -39,18 +40,20 @@ const tokens = TOKENS
 	.split('\n').map(s => s.trim())
 	.filter(s => s.length > 0 && !s.startsWith('//') && !s.startsWith('#'));
 
-// Fetch JSON with retries on non-2xx or non-JSON body.
+// FIX ③: use res.json() directly — single native parse, avoids res.text() + JSON.parse() two-step.
+// Also avoids storing the full text string in memory before parsing.
 async function fetchJsonSafe(url, options, retries = 1) {
 	let lastErr;
 	for (let attempt = 0; attempt <= retries; attempt++) {
 		try {
 			const res = await fetch(url, options);
-			const text = await res.text();
 			if (!res.ok) {
+				await res.body?.cancel(); // drain body to free connection
 				lastErr = new Error(`HTTP ${res.status}`);
 			} else {
 				try {
-					return { ok: true, json: JSON.parse(text) };
+					const json = await res.json();
+					return { ok: true, json };
 				} catch {
 					lastErr = new Error(`HTTP ${res.status} non-JSON`);
 				}
@@ -121,9 +124,9 @@ export default {
 			return;
 		}
 
-		// 1. Init DB + split tokens into warm/cold.
-		await initDb(env);
-		console.log('D1 tables verified.');
+		// FIX ①: Removed initDb() from here — tables must be pre-created once via GET /init-db.
+		// Calling CREATE TABLE IF NOT EXISTS on every 5-min invocation wastes 2 subreqs and CPU.
+		// If you add new tokens and need to reset, call /init-db manually.
 
 		const cachedKeys = await getAllCachedHashes(env);
 		const warmPairs = [];
@@ -170,14 +173,16 @@ export default {
 			const indicesStr = pairs.map(p => p.idx).join(',');
 			return env.SELF.fetch(`https://self/batch?indices=${indicesStr}`)
 				.then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
-				.catch(e => [{ idx: pairs[0]?.idx, error: `fan-out fail: ${e.message}` }]);
+				.catch(e => pairs.map(p => ({ idx: p.idx, error: `fan-out fail: ${e.message}` })));
 		});
 		const checked = (await Promise.all(fanOutPromises)).flat();
 
+		// FIX ④: replaced toLocaleString() with plain string conversion in hot log loop
 		console.log(`Per-token results (${checked.length}):`);
 		checked.forEach((e, i) => {
-			if (e.error) console.log(`  [${i.toString().padStart(2, ' ')}] ERR  ${e.email || e.url || 'n/a'} -- ${e.error}`);
-			else console.log(`  [${i.toString().padStart(2, ' ')}] OK   ${e.email} ${e.url} requests=${e.requests.toLocaleString()}`);
+			const pad = i.toString().padStart(2, ' ');
+			if (e.error) console.log(`  [${pad}] ERR  ${e.email || e.url || 'n/a'} -- ${e.error}`);
+			else console.log(`  [${pad}] OK   ${e.email} ${e.url} requests=${e.requests}`);
 		});
 
 		// 5. Aggregate alerts.
@@ -209,14 +214,15 @@ export default {
 			} else if (e.requests >= WARNING_LIMIT) {
 				const wKey = `warned_${e.email || e.url}`;
 				if (!warnedToday.has(wKey)) {
-					alerts.push(`Warning: ${e.email || e.url} used ${e.requests.toLocaleString()} / 100,000`);
+					alerts.push(`Warning: ${e.email || e.url} used ${e.requests} / 100,000`);
 					newWarnings.push(wKey);
 				}
 			}
 		}
 
 		const allUrls = checked.filter(e => !e.error).map(e => e.url);
-		if (!allUrls.includes(currentContent)) {
+		const hasErrors = checked.some(e => e.error);
+		if (!hasErrors && !allUrls.includes(currentContent)) {
 			alerts.push(`CNAME ${currentContent} not found in account list!`);
 		}
 
@@ -224,7 +230,7 @@ export default {
 		const available = checked.filter(e => !e.error && typeof e.requests === 'number' && e.requests < WARNING_LIMIT);
 		if (available.length === 0) {
 			console.log('No available accounts.');
-			alerts.push(`All accounts errored or exceeded ${WARNING_LIMIT.toLocaleString()} requests.`);
+			alerts.push(`All accounts errored or exceeded ${WARNING_LIMIT} requests.`);
 			if (alerts.length) await notify(alerts.join('\n'));
 			return;
 		}
@@ -240,11 +246,11 @@ export default {
 			const sorted = tiedAccounts.slice().sort((a, b) => a.url < b.url ? -1 : 1);
 			const idx = sorted.findIndex(e => e.url === currentContent);
 			best = sorted[(idx + 1) % sorted.length];
-			console.log(`Tie rotation (${minRequests} req): [${currentContent}] -> [${best.url}] (${tiedAccounts.length} tied, pos ${idx} -> ${(idx + 1) % sorted.length})`);
+			console.log(`Tie rotation (${minRequests} req): [${currentContent}] -> [${best.url}] (${tiedAccounts.length} tied)`);
 		} else {
 			best = tiedAccounts[0];
 		}
-		console.log(`Best: ${best.email} / ${best.url} (${best.requests.toLocaleString()} req)`);
+		console.log(`Best: ${best.email} / ${best.url} (${best.requests} req)`);
 
 		// 7. Update DNS if needed.
 		if (best.url !== currentContent) {
@@ -300,7 +306,7 @@ export default {
 
 				await notify([
 					`Daily Report (UTC)`,
-					`Total requests today: ${totalRequests.toLocaleString()} (${totalPercent}% of ${valid.length} accounts)`,
+					`Total requests today: ${totalRequests} (${totalPercent}% of ${valid.length} accounts)`,
 					`Current DNS: ${best.url}`,
 					``,
 					`Reset at 00:00 UTC`,
@@ -322,6 +328,13 @@ export default {
 };
 
 // ---------- Child batch ----------
+
+// FIX ②: Process token list in sequential chunks to prevent CPU spike from
+// 40 fetches all resolving simultaneously and triggering 40 JSON.parse() in one burst.
+// Each chunk of CHUNK_SIZE runs in parallel; chunks run one after another.
+// Wall-clock time is only mildly affected because D1 + GraphQL are async (no CPU during await).
+const BATCH_CHUNK_SIZE = 8;
+
 async function processBatch(tokenList, env) {
 	const placeholders = tokenList.map(() => '?').join(',');
 	const { results: dbResults } = await env.DB
@@ -336,73 +349,13 @@ async function processBatch(tokenList, env) {
 
 	const dbStats = { inserts: 0, insertErrors: 0, deletes: 0, deleteErrors: 0 };
 
-	const batchResults = await Promise.all(tokenList.map(async (token) => {
-		const tokenTail = token.slice(-8);
-		const meta = cache[token] || null;
-
-		if (!meta) {
-			// ── COLD path ──
-			console.log(`  ...${tokenTail} => COLD`);
-			const newMeta = await resolveMeta(token);
-			if (newMeta.error) {
-				console.error(`  ...${tokenTail} meta error: ${newMeta.error}`);
-				return { email: newMeta.email || null, url: null, error: newMeta.error };
-			}
-
-			try {
-				await env.DB.prepare(
-					'INSERT OR REPLACE INTO token_meta (token_hash, email, account_tag, url) VALUES (?, ?, ?, ?)'
-				).bind(token, newMeta.email, newMeta.accountTag, newMeta.url).run();
-				dbStats.inserts++;
-				console.log(`  ...${tokenTail} cached: ${newMeta.email} => ${newMeta.url}`);
-			} catch (e) {
-				dbStats.insertErrors++;
-				console.error(`  ...${tokenTail} DB insert failed: ${e.message}`);
-			}
-
-			const usage = await resolveUsage(token, newMeta.accountTag);
-			if (usage.error) {
-				const keep = usage.transient ? '(transient, keeping cache)' : '(busting cache)';
-				console.error(`  ...${tokenTail} usage error: ${usage.error} ${keep}`);
-				if (!usage.transient && dbStats.deletes < MAX_DELETES) {
-					try {
-						await env.DB.prepare('DELETE FROM token_meta WHERE token_hash = ?').bind(token).run();
-						dbStats.deletes++;
-					} catch (e) {
-						dbStats.deleteErrors++;
-						console.error(`  ...${tokenTail} DB delete failed: ${e.message}`);
-					}
-				}
-				return { email: newMeta.email, url: newMeta.url, error: usage.error, transient: usage.transient };
-			}
-
-			console.log(`  ...${tokenTail} COLD ok: ${newMeta.email} requests=${usage.requests.toLocaleString()}`);
-			return { email: newMeta.email, url: newMeta.url, requests: usage.requests, error: null };
-
-		} else {
-			// ── WARM path ──
-			console.log(`  ...${tokenTail} => WARM ${meta.email} ${meta.url}`);
-
-			const usage = await resolveUsage(token, meta.accountTag);
-			if (usage.error) {
-				const keep = usage.transient ? '(transient, keeping cache)' : '(busting cache)';
-				console.error(`  ...${tokenTail} usage error: ${usage.error} ${keep}`);
-				if (!usage.transient && dbStats.deletes < MAX_DELETES) {
-					try {
-						await env.DB.prepare('DELETE FROM token_meta WHERE token_hash = ?').bind(token).run();
-						dbStats.deletes++;
-					} catch (e) {
-						dbStats.deleteErrors++;
-						console.error(`  ...${tokenTail} DB delete failed: ${e.message}`);
-					}
-				}
-				return { email: meta.email, url: meta.url, error: usage.error, transient: usage.transient };
-			}
-
-			console.log(`  ...${tokenTail} WARM ok: requests=${usage.requests.toLocaleString()}`);
-			return { email: meta.email, url: meta.url, requests: usage.requests, error: null };
-		}
-	}));
+	// FIX ②: chunk the parallel work so at most BATCH_CHUNK_SIZE JSON parses fire at once
+	const batchResults = [];
+	for (let i = 0; i < tokenList.length; i += BATCH_CHUNK_SIZE) {
+		const chunk = tokenList.slice(i, i + BATCH_CHUNK_SIZE);
+		const chunkResults = await Promise.all(chunk.map(token => processToken(token, cache, dbStats, env)));
+		batchResults.push(...chunkResults);
+	}
 
 	console.log(`  batch done — results=${batchResults.length} D1: +${dbStats.inserts}(err=${dbStats.insertErrors}) -${dbStats.deletes}(err=${dbStats.deleteErrors})`);
 
@@ -411,6 +364,75 @@ async function processBatch(tokenList, env) {
 	}
 
 	return batchResults;
+}
+
+// FIX ②: extracted per-token logic into its own function for cleaner chunking
+async function processToken(token, cache, dbStats, env) {
+	const tokenTail = token.slice(-8);
+	const meta = cache[token] || null;
+
+	if (!meta) {
+		// ── COLD path ──
+		console.log(`  ...${tokenTail} => COLD`);
+		const newMeta = await resolveMeta(token);
+		if (newMeta.error) {
+			console.error(`  ...${tokenTail} meta error: ${newMeta.error}`);
+			return { email: newMeta.email || null, url: null, error: newMeta.error };
+		}
+
+		try {
+			await env.DB.prepare(
+				'INSERT OR REPLACE INTO token_meta (token_hash, email, account_tag, url) VALUES (?, ?, ?, ?)'
+			).bind(token, newMeta.email, newMeta.accountTag, newMeta.url).run();
+			dbStats.inserts++;
+			console.log(`  ...${tokenTail} cached: ${newMeta.email} => ${newMeta.url}`);
+		} catch (e) {
+			dbStats.insertErrors++;
+			console.error(`  ...${tokenTail} DB insert failed: ${e.message}`);
+		}
+
+		const usage = await resolveUsage(token, newMeta.accountTag);
+		if (usage.error) {
+			const keep = usage.transient ? '(transient, keeping cache)' : '(busting cache)';
+			console.error(`  ...${tokenTail} usage error: ${usage.error} ${keep}`);
+			if (!usage.transient && dbStats.deletes < MAX_DELETES) {
+				try {
+					await env.DB.prepare('DELETE FROM token_meta WHERE token_hash = ?').bind(token).run();
+					dbStats.deletes++;
+				} catch (e) {
+					dbStats.deleteErrors++;
+					console.error(`  ...${tokenTail} DB delete failed: ${e.message}`);
+				}
+			}
+			return { email: newMeta.email, url: newMeta.url, error: usage.error, transient: usage.transient };
+		}
+
+		console.log(`  ...${tokenTail} COLD ok: ${newMeta.email} requests=${usage.requests}`);
+		return { email: newMeta.email, url: newMeta.url, requests: usage.requests, error: null };
+
+	} else {
+		// ── WARM path ──
+		console.log(`  ...${tokenTail} => WARM ${meta.email} ${meta.url}`);
+
+		const usage = await resolveUsage(token, meta.accountTag);
+		if (usage.error) {
+			const keep = usage.transient ? '(transient, keeping cache)' : '(busting cache)';
+			console.error(`  ...${tokenTail} usage error: ${usage.error} ${keep}`);
+			if (!usage.transient && dbStats.deletes < MAX_DELETES) {
+				try {
+					await env.DB.prepare('DELETE FROM token_meta WHERE token_hash = ?').bind(token).run();
+					dbStats.deletes++;
+				} catch (e) {
+					dbStats.deleteErrors++;
+					console.error(`  ...${tokenTail} DB delete failed: ${e.message}`);
+				}
+			}
+			return { email: meta.email, url: meta.url, error: usage.error, transient: usage.transient };
+		}
+
+		console.log(`  ...${tokenTail} WARM ok: requests=${usage.requests}`);
+		return { email: meta.email, url: meta.url, requests: usage.requests, error: null };
+	}
 }
 
 async function resolveMeta(token) {
@@ -436,28 +458,24 @@ async function resolveMeta(token) {
 	return { email, accountTag, url: project.subdomain };
 }
 
+const GQL_QUERY = `
+	query($accountTag: String!, $date: Date!) {
+		viewer {
+			accounts(filter: { accountTag: $accountTag }) {
+				workersInvocationsAdaptive(limit: 1 filter: { date_geq: $date, date_leq: $date }) { sum { requests } }
+				pagesFunctionsInvocationsAdaptiveGroups(limit: 1 filter: { date_geq: $date, date_leq: $date }) { sum { requests } }
+			}
+		}
+	}
+`;
+
 async function resolveUsage(token, accountTag) {
 	const today = new Date().toISOString().slice(0, 10);
-
-	const gqlQuery = `
-        query($accountTag: String!, $date: Date!) {
-            viewer {
-                accounts(filter: { accountTag: $accountTag }) {
-                    workersInvocationsAdaptive(
-                        limit: 1 filter: { date_geq: $date, date_leq: $date }
-                    ) { sum { requests } }
-                    pagesFunctionsInvocationsAdaptiveGroups(
-                        limit: 1 filter: { date_geq: $date, date_leq: $date }
-                    ) { sum { requests } }
-                }
-            }
-        }
-    `;
 
 	const gql = await fetchJsonSafe('https://api.cloudflare.com/client/v4/graphql', {
 		method: 'POST',
 		headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-		body: JSON.stringify({ query: gqlQuery, variables: { accountTag, date: today } }),
+		body: JSON.stringify({ query: GQL_QUERY, variables: { accountTag, date: today } }),
 	}, 1); // 1 retry for transient 502/503 errors
 
 	if (!gql.ok) return { error: `graphql ${gql.error}`, transient: true };
