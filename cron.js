@@ -31,8 +31,7 @@ const CHILD_OVERHEAD = 10;
 const COLD_COST = 9;  // resolveMeta (3 fetches w/ retry) + D1 INSERT + GraphQL
 const WARM_COST = 1;  // 1 GraphQL fetch (+ 1 retry on failure, covered by overhead)
 const COLD_PER_BATCH = Math.floor((CHILD_BUDGET - CHILD_OVERHEAD) / COLD_COST); // 4
-// FIX ⑤: reduced WARM_PER_BATCH from 40 → 20 to halve the concurrent JSON.parse burst
-const WARM_PER_BATCH = 20;
+const WARM_PER_BATCH = Math.floor((CHILD_BUDGET - CHILD_OVERHEAD) / WARM_COST); // 40
 const MAX_DELETES = 5; // Cap D1 DELETEs per child to stay within subrequest budget
 // ========================================================================
 
